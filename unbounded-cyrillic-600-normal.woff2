@@ -1,0 +1,352 @@
+package ru.glushkov.ta
+
+import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.MediaStore
+import android.util.Base64
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewAssetLoader
+import androidx.webkit.WebViewFeature
+import java.io.File
+import java.io.FileOutputStream
+
+/**
+ * Оболочка вокруг офлайн-приложения «Глушков·ТА».
+ *
+ * Весь HTML/CSS/JS лежит в assets/www и отдаётся через WebViewAssetLoader
+ * по адресу https://appassets.androidplatform.net/. Виртуальный https-origin
+ * нужен не для красоты: на file:// у WebView урезан localStorage, а здесь
+ * данные атлета живут ровно так же, как в браузере, и переживают обновление
+ * приложения.
+ *
+ * Разрешения не запрашиваются вообще, в том числе INTERNET: приложение
+ * не ходит в сеть.
+ */
+class MainActivity : ComponentActivity() {
+
+    private lateinit var webView: WebView
+    private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var lastBackPress = 0L
+
+    private lateinit var fileChooser: ActivityResultLauncher<Intent>
+
+    private companion object {
+        const val ORIGIN = "https://appassets.androidplatform.net"
+        const val START_URL = "$ORIGIN/assets/www/index.html"
+        const val EXIT_WINDOW_MS = 2000L
+        val BG = 0xFF14181B.toInt()   // не const: .toInt() считается в рантайме
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        fileChooser = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            val cb = filePathCallback
+            filePathCallback = null
+            cb?.onReceiveValue(
+                WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+            )
+        }
+
+        // Рисуем под системными панелями, а потом сами отступаем на их высоту.
+        // Так нижняя навигация приложения не уезжает под жестовую полосу,
+        // а шапка — под вырез камеры.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        WindowCompat.getInsetsController(window, window.decorView)
+            .isAppearanceLightStatusBars = false
+
+        val root = FrameLayout(this).apply { setBackgroundColor(BG) }
+        webView = WebView(this).apply {
+            setBackgroundColor(BG)
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFocusableInTouchMode = true
+        }
+        root.addView(
+            webView,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        setContentView(root)
+
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout() or
+                    WindowInsetsCompat.Type.ime()
+            )
+            webView.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
+
+        configureWebView()
+
+        val assetLoader = WebViewAssetLoader.Builder()
+            .setDomain("appassets.androidplatform.net")
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+            .build()
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest
+            ): WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: WebResourceRequest
+            ): Boolean {
+                val url = request.url
+                if (url.host == "appassets.androidplatform.net") return false
+                openExternally(url)
+                return true
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                view.evaluateJavascript(DOWNLOAD_SHIM_JS, null)
+            }
+        }
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                view: WebView,
+                callback: ValueCallback<Array<Uri>>,
+                params: FileChooserParams
+            ): Boolean {
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+                val pick = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    // Некоторые файловые менеджеры прячут .json под своим mime,
+                    // поэтому фильтр широкий.
+                    type = "*/*"
+                    putExtra(
+                        Intent.EXTRA_MIME_TYPES,
+                        arrayOf("application/json", "text/plain", "application/octet-stream")
+                    )
+                }
+                return try {
+                    fileChooser.launch(Intent.createChooser(pick, "Файл резервной копии"))
+                    true
+                } catch (e: ActivityNotFoundException) {
+                    filePathCallback = null
+                    toast("Не нашёл, чем открыть файлы")
+                    false
+                }
+            }
+        }
+
+        webView.addJavascriptInterface(Bridge(), "AndroidBridge")
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                    return
+                }
+                val now = System.currentTimeMillis()
+                if (now - lastBackPress < EXIT_WINDOW_MS) {
+                    finish()
+                } else {
+                    lastBackPress = now
+                    toast("Ещё раз «назад» — и выходим")
+                }
+            }
+        })
+
+        val restored = savedInstanceState?.let { webView.restoreState(it) }
+        if (restored == null) webView.loadUrl(START_URL)
+    }
+
+    private fun configureWebView() {
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        with(webView.settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true          // localStorage: весь журнал атлета
+            databaseEnabled = true
+            useWideViewPort = true            // уважать <meta viewport>
+            loadWithOverviewMode = false
+            setSupportZoom(false)
+            builtInZoomControls = false
+            displayZoomControls = false
+            textZoom = 100                    // вёрстка в px, системный масштаб её ломает
+            allowFileAccess = false
+            allowContentAccess = false
+            mediaPlaybackRequiresUserGesture = false
+            setGeolocationEnabled(false)
+            setSupportMultipleWindows(false)
+        }
+        // Тема и так тёмная — алгоритмическое затемнение WebView только испортит.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+            WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, false)
+        }
+    }
+
+    private fun openExternally(url: Uri) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, url).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        } catch (e: ActivityNotFoundException) {
+            toast("Нечем открыть ссылку")
+        }
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    /** Мост для кнопки «Экспорт данных»: blob из JS приезжает сюда в base64. */
+    private inner class Bridge {
+        @JavascriptInterface
+        fun saveFile(name: String, mime: String, base64: String) {
+            val bytes = try {
+                Base64.decode(base64, Base64.DEFAULT)
+            } catch (e: IllegalArgumentException) {
+                runOnUiThread { toast("Копия повредилась при сохранении") }
+                return
+            }
+            val safeName = name.substringAfterLast('/').ifBlank { "backup.json" }
+            val type = mime.ifBlank { "application/json" }
+            runOnUiThread {
+                if (saveToDownloads(safeName, type, bytes)) {
+                    toast("Копия сохранена в «Загрузки»")
+                } else {
+                    shareFile(safeName, type, bytes)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun failed() {
+            runOnUiThread { toast("Не получилось собрать файл копии") }
+        }
+    }
+
+    private fun saveToDownloads(name: String, mime: String, bytes: ByteArray): Boolean = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, mime)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) {
+                false
+            } else {
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+                true
+            }
+        } else {
+            // Android 9 и старше: публичная папка требует разрешения на запись,
+            // а мы принципиально не просим разрешений — отдадим через «Поделиться».
+            false
+        }
+    } catch (e: Exception) {
+        false
+    }
+
+    /** Запасной путь: отдать копию через «Поделиться» — в Файлы, почту, тренеру. */
+    private fun shareFile(name: String, mime: String, bytes: ByteArray) {
+        try {
+            val dir = File(cacheDir, "backup").apply { mkdirs() }
+            val file = File(dir, name)
+            FileOutputStream(file).use { it.write(bytes) }
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = mime
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, name)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "Куда сохранить копию"))
+        } catch (e: Exception) {
+            toast("Не удалось сохранить копию")
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        webView.saveState(outState)
+    }
+
+    override fun onPause() {
+        webView.onPause()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        webView.onResume()
+    }
+
+    override fun onDestroy() {
+        webView.removeJavascriptInterface("AndroidBridge")
+        webView.destroy()
+        super.onDestroy()
+    }
+}
+
+/**
+ * В WebView ссылка <a download> с blob-адресом просто ничего не делает.
+ * Перехватываем клик, дочитываем blob и передаём его в Kotlin.
+ * Веб-код при этом не трогаем — он остаётся тем же, что и в браузере.
+ */
+private const val DOWNLOAD_SHIM_JS = """
+(function () {
+  if (window.__glAndroidDownload) return;
+  window.__glAndroidDownload = true;
+  var nativeClick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function () {
+    var href = this.href || '';
+    if (!this.hasAttribute('download') || href.indexOf('blob:') !== 0) {
+      return nativeClick.apply(this, arguments);
+    }
+    var name = this.getAttribute('download') || 'backup.json';
+    fetch(href).then(function (r) { return r.blob(); }).then(function (blob) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        var data = String(reader.result);
+        var comma = data.indexOf(',');
+        AndroidBridge.saveFile(name, blob.type || 'application/json', data.slice(comma + 1));
+      };
+      reader.onerror = function () { AndroidBridge.failed(); };
+      reader.readAsDataURL(blob);
+    }).catch(function () { AndroidBridge.failed(); });
+  };
+})();
+"""

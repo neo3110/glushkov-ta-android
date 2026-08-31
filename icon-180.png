@@ -1,0 +1,35 @@
+// Алина·Fit — офлайн-режим. Кэшируем всё при установке.
+var CACHE = 'yuri-lift-v14';
+var ASSETS = ['.', 'index.html', 'icon-180.png', 'icon-512.png', 'manifest.webmanifest'];
+
+self.addEventListener('install', function (e) {
+  e.waitUntil(
+    caches.open(CACHE).then(function (c) { return c.addAll(ASSETS); }).then(function () { return self.skipWaiting(); })
+  );
+});
+
+self.addEventListener('activate', function (e) {
+  e.waitUntil(
+    caches.keys().then(function (keys) {
+      return Promise.all(keys.filter(function (k) { return k !== CACHE; }).map(function (k) { return caches.delete(k); }));
+    }).then(function () { return self.clients.claim(); })
+  );
+});
+
+// Стратегия: сначала кэш, потом сеть; успешные сетевые ответы докладываем в кэш (шрифты и т.п.)
+self.addEventListener('fetch', function (e) {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    caches.match(e.request, { ignoreSearch: true }).then(function (hit) {
+      if (hit) return hit;
+      return fetch(e.request).then(function (resp) {
+        var copy = resp.clone();
+        caches.open(CACHE).then(function (c) { c.put(e.request, copy); }).catch(function () {});
+        return resp;
+      }).catch(function () {
+        // офлайн и нет в кэше: для навигации отдаём главную
+        if (e.request.mode === 'navigate') return caches.match('index.html');
+      });
+    })
+  );
+});
